@@ -603,6 +603,78 @@ PYBIND11_MODULE(pyngp, m) {
 			"If the aabb parameter specifies an inside-out (\"empty\") box (default), the current render_aabb bounding box is used."
 		)
 		.def(
+			"compute_sparse_volume",
+			[](Testbed& self, int resolution, BoundingBox aabb, float thresh, int chunk_size) {
+				Testbed::SparseVolume sparse = self.compute_sparse_volume(resolution, aabb, thresh, chunk_size);
+
+				// Convert voxel indices to numpy array
+				py::array_t<int32_t> coords({static_cast<int>(sparse.coords.size()), 3});
+				py::array_t<float> colors({static_cast<int>(sparse.colors.size()), 3});
+				py::array_t<float> densities({static_cast<int>(sparse.densities.size())});
+
+				auto coords_mut = coords.mutable_unchecked<2>();
+				auto col_mut = colors.mutable_unchecked<2>();
+				auto den_mut = densities.mutable_unchecked<1>();
+
+				for (size_t i = 0; i < sparse.coords.size(); ++i) {
+					coords_mut(i, 0) = sparse.coords[i].x;
+					coords_mut(i, 1) = sparse.coords[i].y;
+					coords_mut(i, 2) = sparse.coords[i].z;
+					col_mut(i, 0) = sparse.colors[i].x;
+					col_mut(i, 1) = sparse.colors[i].y;
+					col_mut(i, 2) = sparse.colors[i].z;
+					den_mut(i) = sparse.densities[i];
+				}
+
+				// Convert transform parameters to numpy arrays
+				py::array_t<float> origin(3);
+				py::array_t<float> voxel_size(3);
+				py::array_t<int32_t> grid_resolution(3);
+				py::array_t<float> transform({4, 4});
+
+				auto org_mut = origin.mutable_unchecked<1>();
+				auto vs_mut = voxel_size.mutable_unchecked<1>();
+				auto res_mut = grid_resolution.mutable_unchecked<1>();
+				auto transform_mut = transform.mutable_unchecked<2>();
+
+				for (int i = 0; i < 3; ++i) {
+					org_mut(i) = sparse.origin[i];
+					vs_mut(i) = sparse.voxel_size[i];
+					res_mut(i) = sparse.resolution[i];
+				}
+
+				for (int row = 0; row < 4; ++row) {
+					for (int col = 0; col < 4; ++col) {
+						transform_mut(row, col) = 0.0f;
+					}
+				}
+				transform_mut(0, 0) = sparse.voxel_size.x;
+				transform_mut(1, 1) = sparse.voxel_size.y;
+				transform_mut(2, 2) = sparse.voxel_size.z;
+				transform_mut(0, 3) = sparse.origin.x;
+				transform_mut(1, 3) = sparse.origin.y;
+				transform_mut(2, 3) = sparse.origin.z;
+				transform_mut(3, 3) = 1.0f;
+
+				return py::dict(
+					py::arg("coords") = coords,
+					py::arg("rgb") = colors,
+					py::arg("density") = densities,
+					py::arg("origin") = origin,
+					py::arg("voxel_size") = voxel_size,
+					py::arg("resolution") = grid_resolution,
+					py::arg("transform") = transform
+				);
+			},
+			py::arg("resolution") = 256,
+			py::arg("aabb") = BoundingBox{},
+			py::arg("thresh") = 2.5f,
+			py::arg("chunk_size") = 256,
+			"Compute a sparse volume from the current NeRF model. "
+			"Returns coords (integer voxel indices) and transform parameters to convert to NeRF/COLMAP coordinates. "
+			"Use world_pos = (coords + 0.5, 1) @ transform.T."
+		)
+		.def(
 			"compute_marching_cubes_mesh",
 			&Testbed::compute_marching_cubes_mesh,
 			py::arg("resolution") = ivec3(256),

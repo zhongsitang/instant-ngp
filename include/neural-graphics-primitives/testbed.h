@@ -580,6 +580,23 @@ public:
 		const fs::path& filename, int res, BoundingBox aabb = {}, float thresh = 2.5f, float density_range = 4.f, bool flip_y_and_z_axes = false
 	);
 
+	// Sparse volume representation with integer voxel indices and transform to NeRF/COLMAP coordinates
+	struct SparseVolume {
+		std::vector<ivec3> coords;         // Integer voxel indices in the grid
+		std::vector<vec3> colors;          // RGB colors [0,1]
+		std::vector<float> densities;      // Density values
+		vec3 origin;                       // Grid origin in NeRF/COLMAP coordinate system
+		vec3 voxel_size;                   // Voxel size in NeRF/COLMAP coordinate system
+		ivec3 resolution;                  // Grid resolution
+	};
+
+	SparseVolume compute_sparse_volume(
+		int res = 256,
+		BoundingBox aabb = {},
+		float thresh = 2.5f,
+		int chunk_size = 256
+	);
+
 	fs::path root_dir();
 	void set_root_dir(const fs::path& dir);
 

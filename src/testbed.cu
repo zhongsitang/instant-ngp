@@ -584,6 +584,109 @@ ivec3 Testbed::compute_and_save_png_slices(
 	return res3d;
 }
 
+Testbed::SparseVolume Testbed::compute_sparse_volume(
+	int res,
+	BoundingBox aabb,
+	float thresh,
+	int chunk_size
+) {
+	if (m_testbed_mode != ETestbedMode::Nerf) {
+		throw std::runtime_error{"Sparse volume export is only supported in NeRF mode."};
+	}
+
+	if (chunk_size <= 0) {
+		throw std::runtime_error{"Chunk size must be positive."};
+	}
+
+	// Handle default aabb, consistent with compute_marching_cubes_mesh behavior
+	mat3 render_aabb_to_local = mat3::identity();
+	if (aabb.is_empty()) {
+		aabb = m_render_aabb;
+		render_aabb_to_local = m_render_aabb_to_local;
+	}
+
+	ivec3 full_res = get_marching_cubes_res(res, aabb);
+	vec3 aabb_min = aabb.min;
+	vec3 aabb_diag = aabb.diag();
+
+	// Save current state
+	auto old_aabb = m_render_aabb;
+	auto old_local = m_render_aabb_to_local;
+	m_render_aabb_to_local = render_aabb_to_local;
+
+	SparseVolume result;
+	result.resolution = full_res;
+
+	// Compute grid corners in NGP world coordinates
+	vec3 ngp_corner_min = transpose(render_aabb_to_local) * aabb_min;
+	vec3 ngp_corner_max = transpose(render_aabb_to_local) * (aabb_min + aabb_diag);
+
+	// Convert corners to NeRF/COLMAP coordinates
+	vec3 nerf_corner_min = m_nerf.training.dataset.ngp_position_to_nerf(ngp_corner_min);
+	vec3 nerf_corner_max = m_nerf.training.dataset.ngp_position_to_nerf(ngp_corner_max);
+
+	// Due to axis permutation, min/max may swap, so recompute
+	result.origin = min(nerf_corner_min, nerf_corner_max);
+	vec3 nerf_diag = abs(nerf_corner_max - nerf_corner_min);
+	result.voxel_size = nerf_diag / vec3(full_res);
+
+	// View direction for RGBA computation
+	vec3 effective_view_dir = vec3{0.0f, 0.0f, 1.0f};
+
+	// Process volume in chunks to avoid GPU memory issues
+	for (int z = 0; z < full_res.z; z += chunk_size) {
+		for (int y = 0; y < full_res.y; y += chunk_size) {
+			for (int x = 0; x < full_res.x; x += chunk_size) {
+				ivec3 chunk_start = {x, y, z};
+				ivec3 chunk_end = min(chunk_start + ivec3(chunk_size), full_res);
+				ivec3 chunk_res = chunk_end - chunk_start;
+
+				// Compute chunk bounding box in aabb space
+				vec3 chunk_min = aabb_min + (vec3(chunk_start) / vec3(full_res)) * aabb_diag;
+				vec3 chunk_max = aabb_min + (vec3(chunk_end) / vec3(full_res)) * aabb_diag;
+				BoundingBox chunk_aabb{chunk_min, chunk_max};
+
+				// Set render aabb for this chunk
+				m_render_aabb = chunk_aabb;
+
+				// Get RGBA values on grid (density_as_alpha=true)
+				GPUMemory<vec4> rgba = get_rgba_on_grid(chunk_res, effective_view_dir, true, 0.0f, true);
+
+				// Copy to CPU
+				std::vector<vec4> rgba_cpu(rgba.size());
+				rgba.copy_to_host(rgba_cpu);
+
+				// Filter voxels above density threshold
+				for (int lz = 0; lz < chunk_res.z; ++lz) {
+					for (int ly = 0; ly < chunk_res.y; ++ly) {
+						for (int lx = 0; lx < chunk_res.x; ++lx) {
+							size_t idx = lx + ly * chunk_res.x + lz * chunk_res.x * chunk_res.y;
+							const vec4& voxel = rgba_cpu[idx];
+
+							// Skip voxels below threshold
+							if (voxel.w <= thresh) {
+								continue;
+							}
+
+							// Store integer voxel index
+							ivec3 voxel_idx = chunk_start + ivec3{lx, ly, lz};
+							result.coords.emplace_back(voxel_idx);
+							result.colors.emplace_back(vec3{voxel.x, voxel.y, voxel.z});
+							result.densities.emplace_back(voxel.w);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Restore original state
+	m_render_aabb = old_aabb;
+	m_render_aabb_to_local = old_local;
+
+	return result;
+}
+
 fs::path Testbed::root_dir() {
 	if (m_root_dir.empty()) {
 		set_root_dir(discover_root_dir());

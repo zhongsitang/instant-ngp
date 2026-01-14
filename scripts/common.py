@@ -37,6 +37,90 @@ def mse2psnr(x): return -10.*np.log(x)/np.log(10.)
 def sanitize_path(path):
 	return str(PurePosixPath(path.relative_to(PAPER_FOLDER)))
 
+def compute_visible_volume(
+	testbed,
+	res=256,
+	aabb=None,
+	thresh=2.5,
+	chunk_size=256,
+	depth_epsilon=1e-3,
+):
+	"""
+	Compute sparse volume and filter voxels invisible from all training views.
+
+	Args:
+		testbed: instant-ngp Testbed instance
+		res: target resolution for sparse volume
+		aabb: bounding box (uses testbed.render_aabb if None)
+		thresh: density threshold for extraction
+		chunk_size: chunk size for computation
+		depth_epsilon: depth tolerance for visibility test
+
+	Returns:
+		dict with 'coords', 'rgb', 'density', and 'transform' of visible voxels
+	"""
+	# setup AABB
+	if aabb is None:
+		aabb = testbed.render_aabb
+	else:
+		import pyngp as ngp
+
+		aabb = ngp.BoundingBox(aabb)
+
+	# sparse volume → world positions
+	sparse = testbed.compute_sparse_volume(res, aabb, thresh, chunk_size)
+	assert sparse["coords"].size > 0, "No voxels found"
+
+	coords = sparse["coords"].astype(np.float32)
+	coords_h = np.concatenate([coords + 0.5, np.ones((coords.shape[0], 1), dtype=np.float32)], axis=1)
+	pos_world = coords_h @ sparse["transform"].T
+	pos_world = pos_world[:, :3]
+
+	# visibility across views
+	dataset = testbed.nerf.training.dataset
+	visible = np.zeros(pos_world.shape[0], dtype=bool)
+
+	for i in range(int(dataset.n_images)):
+		testbed.set_camera_to_training_view(i)
+		meta = dataset.metadata[i]
+		W, H = int(meta.resolution[0]), int(meta.resolution[1])
+
+		_, depth = testbed.render_to_cpu(W, H, 1, False, 0.0, 0.0, 0.0, 0.0)  # (H, W)
+
+		# camera params (c2w: camera-to-world)
+		c2w_R = testbed.camera_matrix[:3, :]
+		c2w_t = testbed.camera_matrix[3, :]
+
+		focal = testbed.relative_focal_length * meta.resolution[testbed.fov_axis] * testbed.zoom
+		center = (0.5 - testbed.screen_center) * testbed.zoom + 0.5
+
+		# world → camera → pixel
+		cam_pts = (pos_world - c2w_t) @ c2w_R.T  # (N, 3)
+		z = np.clip(cam_pts[:, 2], 1e-6, None)
+
+		px = np.floor(cam_pts[:, 0] / z * focal + center[0] * W).astype(np.int32)
+		py = np.floor(cam_pts[:, 1] / z * focal + center[1] * H).astype(np.int32)
+
+		# visibility test
+		inside = (px >= 0) & (py >= 0) & (px < W) & (py < H) & (z > 1e-6)
+
+		px_safe = np.clip(px, 0, W - 1)
+		py_safe = np.clip(py, 0, H - 1)
+		depth_sample = depth[py_safe, px_safe]
+
+		depth_ok = (depth_sample > 0) & (cam_pts[:, 2] <= depth_sample + depth_epsilon)
+		visible |= inside & depth_ok
+
+		if np.all(visible):
+			break
+
+	return {
+		"coords": sparse["coords"][visible],
+		"rgb": sparse["rgb"][visible],
+		"density": sparse["density"][visible],
+		"transform": sparse["transform"],
+	}
+
 # from https://stackoverflow.com/questions/31638651/how-can-i-draw-lines-into-numpy-arrays
 def trapez(y,y0,w):
 	return np.clip(np.minimum(y+1+w/2-y0, -y+1+w/2+y0),0,1)
