@@ -141,6 +141,125 @@ pybind11::dict Testbed::compute_marching_cubes_mesh(ivec3 res3d, BoundingBox aab
 	return py::dict(py::arg("V") = cpuverts, py::arg("N") = cpunormals, py::arg("C") = cpucolors, py::arg("F") = cpuindices);
 }
 
+pybind11::dict Testbed::compute_sparse_volume(ivec3 res3d, BoundingBox aabb, float thresh) {
+	mat3 render_aabb_to_local = mat3::identity();
+	if (aabb.is_empty()) {
+		aabb = m_testbed_mode == ETestbedMode::Nerf ? m_render_aabb : m_aabb;
+		render_aabb_to_local = m_render_aabb_to_local;
+	}
+
+	// Round resolution to multiples of 16 (same as marching_cubes)
+	res3d.x = next_multiple((unsigned int)res3d.x, 16u);
+	res3d.y = next_multiple((unsigned int)res3d.y, 16u);
+	res3d.z = next_multiple((unsigned int)res3d.z, 16u);
+
+	// Use default thresh if not specified (same as marching_cubes)
+	if (thresh == std::numeric_limits<float>::max()) {
+		thresh = m_mesh.thresh;
+	}
+
+	// Compute voxel size and origin for voxel-centered sampling
+	// With voxel_centers=true: sample_pos = aabb.min + (idx + 0.5) / res * diag
+	// Sparse volume formula: world_pos = origin + (coords + 0.5) * voxel_size
+	// These align when: origin = aabb.min, voxel_size = diag / res
+	vec3 diag = aabb.max - aabb.min;
+	vec3 scale = diag / vec3(res3d);
+	float voxel_size = (scale.x + scale.y + scale.z) / 3.0f;
+	vec3 origin = aabb.min;
+
+	// Save original render_aabb settings
+	auto old_render_aabb = m_render_aabb;
+	auto old_render_aabb_to_local = m_render_aabb_to_local;
+
+	// Collect sparse voxels from all slices
+	std::vector<ivec3> all_coords;
+	std::vector<vec3> all_colors;
+	std::vector<float> all_densities;
+
+	// Process the volume one Z-slice at a time to minimize GPU memory usage
+	for (int z = 0; z < res3d.z; ++z) {
+		// Compute the sub-aabb for this Z slice
+		// With voxel_centers=true, the slice covers z range [(z+0.5)/res, (z+0.5)/res] in normalized coords
+		// But get_rgba_on_grid expects aabb that will be sampled with voxel_centers formula
+		BoundingBox slice_aabb = aabb;
+		slice_aabb.min.z = aabb.min.z + z * scale.z;
+		slice_aabb.max.z = aabb.min.z + (z + 1) * scale.z;
+
+		// Set render_aabb for this slice
+		m_render_aabb = slice_aabb;
+		m_render_aabb_to_local = render_aabb_to_local;
+
+		// Get RGBA grid for this slice with density_as_alpha=true
+		// voxel_centers=true to sample at voxel centers (more appropriate for sparse voxel export)
+		ivec3 slice_res = {res3d.x, res3d.y, 1};
+		GPUMemory<vec4> rgba = get_rgba_on_grid(slice_res, vec3{0.0f, 0.0f, 1.0f}, true, 0.0f, true);
+
+		// Copy to CPU
+		std::vector<vec4> rgba_cpu(rgba.size());
+		rgba.copy_to_host(rgba_cpu);
+
+		// Extract sparse voxels from this slice
+		const uint32_t n_elements = res3d.x * res3d.y;
+		for (uint32_t i = 0; i < n_elements; ++i) {
+			vec4 rgbd = rgba_cpu[i];
+			float density = rgbd.w;  // density is in alpha when density_as_alpha=true
+
+			if (density > thresh) {
+				int x = i % res3d.x;
+				int y = i / res3d.x;
+
+				all_coords.push_back(ivec3{x, y, z});
+				all_colors.push_back(vec3{rgbd.x, rgbd.y, rgbd.z});
+				all_densities.push_back(density);
+			}
+		}
+	}
+
+	// Restore render_aabb
+	m_render_aabb = old_render_aabb;
+	m_render_aabb_to_local = old_render_aabb_to_local;
+
+	// Create numpy arrays for output
+	size_t n_valid = all_coords.size();
+
+	py::array_t<int> coords_arr({(int)n_valid, 3});
+	py::array_t<float> colors_arr({(int)n_valid, 3});
+	py::array_t<float> densities_arr({(int)n_valid});
+
+	if (n_valid > 0) {
+		int* coords_ptr = (int*)coords_arr.request().ptr;
+		float* colors_ptr = (float*)colors_arr.request().ptr;
+		float* densities_ptr = (float*)densities_arr.request().ptr;
+
+		for (size_t i = 0; i < n_valid; ++i) {
+			coords_ptr[i * 3 + 0] = all_coords[i].x;
+			coords_ptr[i * 3 + 1] = all_coords[i].y;
+			coords_ptr[i * 3 + 2] = all_coords[i].z;
+
+			colors_ptr[i * 3 + 0] = all_colors[i].x;
+			colors_ptr[i * 3 + 1] = all_colors[i].y;
+			colors_ptr[i * 3 + 2] = all_colors[i].z;
+
+			densities_ptr[i] = all_densities[i];
+		}
+	}
+
+	py::array_t<float> origin_arr(3);
+	float* origin_ptr = (float*)origin_arr.request().ptr;
+	origin_ptr[0] = origin.x;
+	origin_ptr[1] = origin.y;
+	origin_ptr[2] = origin.z;
+
+	return py::dict(
+		py::arg("coords") = coords_arr,
+		py::arg("colors") = colors_arr,
+		py::arg("densities") = densities_arr,
+		py::arg("origin") = origin_arr,
+		py::arg("voxel_size") = voxel_size,
+		py::arg("resolution") = res3d
+	);
+}
+
 // Returns RGBA and depth buffers
 std::pair<py::array_t<float>, py::array_t<float>>
 	Testbed::render_to_cpu(int width, int height, int spp, bool linear, float start_time, float end_time, float fps, float shutter_fraction) {
@@ -611,6 +730,20 @@ PYBIND11_MODULE(pyngp, m) {
 			"Compute a marching cubes mesh from the current SDF or NeRF model. "
 			"Returns a python dict with numpy arrays V (vertices), N (vertex normals), C (vertex colors), and F (triangular faces). "
 			"`thresh` is the density threshold; use 0 for SDF; 2.5 works well for NeRF. "
+			"If the aabb parameter specifies an inside-out (\"empty\") box (default), the current render_aabb bounding box is used."
+		)
+		.def(
+			"compute_sparse_volume",
+			&Testbed::compute_sparse_volume,
+			py::arg("resolution") = ivec3(256),
+			py::arg("aabb") = BoundingBox{},
+			py::arg("thresh") = std::numeric_limits<float>::max(),
+			"Compute a sparse volume representation from the current NeRF model. "
+			"Returns a python dict with: coords (Nx3 int array of voxel coordinates), colors (Nx3 float array), "
+			"densities (N float array), origin (3 float array), voxel_size (float), and resolution (ivec3). "
+			"Only voxels with density > thresh are included. Processing is done one Z-slice at a time to manage GPU memory. "
+			"World position can be computed as: world_pos = origin + (coords + 0.5) * voxel_size. "
+			"The coordinates are aligned with compute_marching_cubes_mesh vertices. "
 			"If the aabb parameter specifies an inside-out (\"empty\") box (default), the current render_aabb bounding box is used."
 		)
 		// Interesting members.
