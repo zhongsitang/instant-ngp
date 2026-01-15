@@ -872,7 +872,9 @@ PYBIND11_MODULE(pyngp, m) {
 		.def("set_rendering_extra_dims", &Testbed::Nerf::set_rendering_extra_dims, "Set the extra dims that are used for rendering.")
 		.def(
 			"get_rendering_extra_dims", &Testbed::Nerf::get_rendering_extra_dims_cpu, "Get the extra dims that are currently used for rendering."
-		);
+		)
+		.def_readwrite("surface_rendering", &Testbed::Nerf::surface_rendering)
+		.def_readwrite("surface_rendering_threshold", &Testbed::Nerf::surface_rendering_threshold);
 
 	py::class_<BRDFParams> brdfparams(m, "BRDFParams");
 	brdfparams.def_readwrite("metallic", &BRDFParams::metallic)
