@@ -442,3 +442,252 @@ float l1_regularization_negative(float value, float weight = 1e-4f) {
 float near_distance_penalty(float density_logit, float depth, float near_distance, float weight = 1e-4f) {
     return (density_logit > -10.0f && depth < near_distance) ? weight : 0.0f;
 }
+
+// =============================================================================
+// Loss Functions with Gradient Softening
+// =============================================================================
+//
+// instant-ngp implements multiple loss functions with built-in gradient smoothing.
+// These are critical for training stability, especially for volume rendering.
+//
+// Key gradient softening techniques:
+// 1. Huber Loss: quadratic near 0, linear far (soft transition)
+// 2. RelativeL2: denominator-based smoothing (+ 1e-2)
+// 3. SMAPE: symmetric percentage with smoothing
+// 4. LogL1: logarithmic scaling for large errors
+// =============================================================================
+
+/// Loss and gradient pair for differentiable rendering
+struct LossAndGradient : IDifferentiable
+{
+    float3 loss;
+    float3 gradient;
+};
+
+/// L2 Loss (Mean Squared Error)
+/// Standard loss, gradients can be large for large errors
+[Differentiable]
+LossAndGradient l2_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    LossAndGradient result;
+    result.loss = difference * difference;
+    result.gradient = 2.0f * difference;
+    return result;
+}
+
+/// L1 Loss (Mean Absolute Error)
+/// Constant gradient magnitude, but discontinuous at 0
+[Differentiable]
+LossAndGradient l1_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    LossAndGradient result;
+    result.loss = abs(difference);
+    result.gradient = sign(difference);
+    return result;
+}
+
+/// Relative L2 Loss
+/// Denominator-based gradient softening: divides by (prediction² + epsilon)
+/// This prevents gradient explosion when prediction is small
+/// Pattern from instant-ngp: denom = prediction * prediction + 1e-2f
+[Differentiable]
+LossAndGradient relative_l2_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    // Smoothing denominator prevents division by zero and softens gradients
+    float3 denom = prediction * prediction + 1e-2f;
+    LossAndGradient result;
+    result.loss = difference * difference / denom;
+    result.gradient = 2.0f * difference / denom;
+    return result;
+}
+
+/// Huber Loss (Smooth L1)
+/// Quadratic near zero, linear far away
+/// This is the key gradient softening loss function:
+/// - For |diff| <= alpha: loss = 0.5 * diff² / alpha (quadratic, soft gradients)
+/// - For |diff| > alpha: loss = |diff| - 0.5 * alpha (linear, bounded gradients)
+///
+/// instant-ngp uses alpha=0.1 and divides result by 5
+/// The soft transition at alpha prevents gradient explosion for large errors
+[Differentiable]
+LossAndGradient huber_loss(float3 target, float3 prediction, float alpha = 0.1f) {
+    float3 difference = prediction - target;
+    float3 abs_diff = abs(difference);
+    float3 square = 0.5f / alpha * difference * difference;
+
+    LossAndGradient result;
+    // Loss: quadratic inside alpha, linear outside
+    result.loss = float3(
+        abs_diff.x > alpha ? (abs_diff.x - 0.5f * alpha) : square.x,
+        abs_diff.y > alpha ? (abs_diff.y - 0.5f * alpha) : square.y,
+        abs_diff.z > alpha ? (abs_diff.z - 0.5f * alpha) : square.z
+    );
+    // Gradient: linear inside alpha (soft), constant ±1 outside (bounded)
+    result.gradient = float3(
+        abs_diff.x > alpha ? sign(difference.x) : (difference.x / alpha),
+        abs_diff.y > alpha ? sign(difference.y) : (difference.y / alpha),
+        abs_diff.z > alpha ? sign(difference.z) : (difference.z / alpha)
+    );
+    return result;
+}
+
+/// Huber Loss with instant-ngp default parameters
+/// Uses alpha=0.1 and divides by 5 for normalization
+[Differentiable]
+LossAndGradient huber_loss_default(float3 target, float3 prediction) {
+    LossAndGradient result = huber_loss(target, prediction, 0.1f);
+    result.loss = result.loss / 5.0f;
+    result.gradient = result.gradient / 5.0f;
+    return result;
+}
+
+/// Log L1 Loss
+/// Uses logarithmic scaling to soften gradients for large errors
+/// loss = log(|diff| + 1), gradient = sign(diff) / (|diff| + 1)
+/// The +1 ensures gradient is bounded by 1 even at diff=0
+[Differentiable]
+LossAndGradient log_l1_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    float3 divisor = abs(difference) + 1.0f;
+    LossAndGradient result;
+    result.loss = float3(log(divisor.x), log(divisor.y), log(divisor.z));
+    result.gradient = sign(difference) / divisor;
+    return result;
+}
+
+/// SMAPE Loss (Symmetric Mean Absolute Percentage Error)
+/// Uses symmetric denominator for balanced gradient softening
+/// denom = 0.5 * (|pred| + |target|) + epsilon
+/// This prevents gradient explosion when either pred or target is small
+[Differentiable]
+LossAndGradient smape_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    // Symmetric smoothing denominator
+    float3 denom = 0.5f * (abs(prediction) + abs(target)) + 1e-2f;
+    LossAndGradient result;
+    result.loss = abs(difference) / denom;
+    result.gradient = sign(difference) / denom;
+    return result;
+}
+
+/// MAPE Loss (Mean Absolute Percentage Error)
+/// Uses prediction as denominator for gradient softening
+/// denom = |pred| + epsilon
+[Differentiable]
+LossAndGradient mape_loss(float3 target, float3 prediction) {
+    float3 difference = prediction - target;
+    float3 denom = abs(prediction) + 1e-2f;
+    LossAndGradient result;
+    result.loss = abs(difference) / denom;
+    result.gradient = sign(difference) / denom;
+    return result;
+}
+
+// =============================================================================
+// Activation Functions with Gradient Properties
+// =============================================================================
+//
+// instant-ngp uses specific activations chosen for gradient stability:
+// 1. Logistic (Sigmoid): naturally bounded output and gradients
+// 2. Exponential: clamped input to prevent overflow
+// 3. ReLU: simple but has zero gradient for negative inputs
+// =============================================================================
+
+/// Logistic (Sigmoid) activation: sigma(x) = 1 / (1 + exp(-x))
+/// Output bounded in (0, 1), gradient bounded in (0, 0.25]
+/// Maximum gradient of 0.25 occurs at x=0 - this is natural gradient softening
+[Differentiable]
+float logistic(float x) {
+    // Clamp input to prevent exp overflow
+    float clamped = clamp(x, -EXP_LIMIT, EXP_LIMIT);
+    return 1.0f / (1.0f + exp(-clamped));
+}
+
+/// Logistic derivative: sigma'(x) = sigma(x) * (1 - sigma(x))
+/// Naturally bounded in (0, 0.25] - provides automatic gradient softening
+[Differentiable]
+float logistic_derivative(float x) {
+    float sigma = logistic(x);
+    return sigma * (1.0f - sigma);
+}
+
+/// Exponential activation with input clamping
+/// Pattern from instant-ngp: clamp to [-10, 10] for RGB
+[Differentiable]
+float exponential_activation(float x, float limit = 10.0f) {
+    return exp(clamp(x, -limit, limit));
+}
+
+/// Exponential derivative with stricter clamping for gradient stability
+/// Pattern from instant-ngp: clamp to [-15, 15] for density derivatives
+[Differentiable]
+float exponential_activation_derivative(float x, float limit = 15.0f) {
+    return exp(clamp(x, -limit, limit));
+}
+
+/// ReLU activation
+[Differentiable]
+float relu(float x) {
+    return max(x, 0.0f);
+}
+
+/// ReLU derivative (0 for x < 0, 1 for x > 0)
+float relu_derivative(float x) {
+    return x > 0.0f ? 1.0f : 0.0f;
+}
+
+/// Softplus activation: log(1 + exp(x))
+/// Smooth approximation of ReLU with continuous gradients everywhere
+/// Derivative: sigmoid(x), which is naturally bounded in (0, 1)
+[Differentiable]
+float softplus(float x) {
+    // For large x, softplus(x) ≈ x, use this to avoid overflow
+    if (x > EXP_LIMIT) {
+        return x;
+    }
+    // For very negative x, softplus(x) ≈ exp(x), use this to avoid underflow
+    if (x < -EXP_LIMIT) {
+        return exp(x);
+    }
+    return log(1.0f + exp(x));
+}
+
+/// Softplus derivative = sigmoid(x), naturally bounded in (0, 1)
+[Differentiable]
+float softplus_derivative(float x) {
+    return logistic(x);
+}
+
+// =============================================================================
+// Gradient Scaling and Normalization
+// =============================================================================
+
+/// Scale gradient by loss scale factor
+/// Used in training to balance different loss terms
+[Differentiable]
+float3 scale_gradient(float3 gradient, float loss_scale) {
+    return gradient * loss_scale;
+}
+
+/// Clip gradient magnitude to prevent explosion
+/// If ||gradient|| > max_norm, scale it down to max_norm
+[Differentiable]
+float3 clip_gradient_norm(float3 gradient, float max_norm) {
+    float norm_sq = dot(gradient, gradient);
+    if (norm_sq > max_norm * max_norm) {
+        return gradient * (max_norm / sqrt(norm_sq));
+    }
+    return gradient;
+}
+
+/// Smooth gradient clipping using tanh
+/// Provides soft transition instead of hard clipping
+/// gradient_out = max_norm * tanh(gradient / max_norm)
+[Differentiable]
+float3 smooth_clip_gradient(float3 gradient, float max_norm) {
+    return max_norm * float3(
+        tanh(gradient.x / max_norm),
+        tanh(gradient.y / max_norm),
+        tanh(gradient.z / max_norm)
+    );
+}
