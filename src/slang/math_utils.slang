@@ -146,6 +146,228 @@ float3 safe_div_with_min(in float3 a, in float b, in float min_denom = 1e-6f) {
 }
 
 // =============================================================================
+// Volume Rendering Safe Division (0/0 Indeterminate Forms)
+// =============================================================================
+//
+// In volume rendering, we often encounter 0/0 situations:
+//   color = weighted_color / sigma  (when sigma=0, weighted_color=0 too)
+//   depth = depth_num / alpha       (when alpha=0, depth_num=0 too)
+//   rgb_bg = suffix / T             (when T=0, suffix=0 too)
+//
+// The key insight: these ratios have well-defined limits because the
+// numerator and denominator approach 0 at related rates.
+//
+// Three strategies:
+// 1. safe_div_zero: return 0 when indeterminate (simplest, used for depth)
+// 2. safe_div_limit: return a specified limit value (used for color extraction)
+// 3. safe_div_ratio: handle a = k*b case, return k (used for suffix/T)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Strategy 1: Zero on indeterminate (for quantities that don't matter when zero)
+// -----------------------------------------------------------------------------
+// Use case: depth = depth_num / alpha
+// When alpha=0, the ray is fully transparent, depth value is irrelevant
+// Gradient: zero out both to prevent NaN propagation
+
+void bw_safe_div_zero(inout DifferentialPair<float> a, inout DifferentialPair<float> b, float.Differential R) {
+    if (abs(b.p) < TINY_VAL) {
+        // Both gradients zero: this path contributes nothing to loss
+        a = DifferentialPair<float>(a.p, 0.0f);
+        b = DifferentialPair<float>(b.p, 0.0f);
+    } else {
+        float inv_b = 1.0f / b.p;
+        float inv_b2 = inv_b * inv_b;
+        a = DifferentialPair<float>(a.p, R * inv_b);
+        b = DifferentialPair<float>(b.p, -a.p * inv_b2 * R);
+    }
+}
+
+[BackwardDerivative(bw_safe_div_zero)]
+float safe_div_zero(float a, float b) {
+    return abs(b) < TINY_VAL ? 0.0f : a / b;
+}
+
+// -----------------------------------------------------------------------------
+// Strategy 2: Fallback value on indeterminate (for color extraction)
+// -----------------------------------------------------------------------------
+// Use case: color = weighted_color / sigma
+// When sigma=0, no contribution anyway, but we want a sensible fallback
+// for numerical stability. Return fallback and zero gradients.
+
+void bw_safe_div_fallback(
+    inout DifferentialPair<float> a,
+    inout DifferentialPair<float> b,
+    float fallback,
+    float.Differential R)
+{
+    if (abs(b.p) < TINY_VAL) {
+        // Return fallback value, zero gradients
+        a = DifferentialPair<float>(a.p, 0.0f);
+        b = DifferentialPair<float>(b.p, 0.0f);
+    } else {
+        float inv_b = 1.0f / b.p;
+        float inv_b2 = inv_b * inv_b;
+        a = DifferentialPair<float>(a.p, R * inv_b);
+        b = DifferentialPair<float>(b.p, -a.p * inv_b2 * R);
+    }
+}
+
+[BackwardDerivative(bw_safe_div_fallback)]
+float safe_div_fallback(float a, float b, float fallback) {
+    return abs(b) < TINY_VAL ? fallback : a / b;
+}
+
+[Differentiable]
+float3 safe_div_fallback(float3 a, float b, float3 fallback) {
+    return float3(
+        safe_div_fallback(a.x, b, fallback.x),
+        safe_div_fallback(a.y, b, fallback.y),
+        safe_div_fallback(a.z, b, fallback.z)
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Strategy 3: Ratio-preserving division (for suffix/T patterns)
+// -----------------------------------------------------------------------------
+// Use case: rgb_bg = suffix / T  (in instant-ngp train_nerf.cuh:400)
+// When T→0, suffix→0 proportionally, limit is the "background color"
+//
+// instant-ngp pattern: suffix / fmaxf(1e-6f, T)
+// This clamps denominator but preserves gradient flow
+
+void bw_safe_div_clamp(
+    inout DifferentialPair<float> a,
+    inout DifferentialPair<float> b,
+    float min_denom,
+    float.Differential R)
+{
+    float b_clamped = max(abs(b.p), min_denom);
+    float inv_b = 1.0f / b_clamped;
+    float inv_b2 = inv_b * inv_b;
+
+    // Gradient for a: always 1/b_clamped
+    a = DifferentialPair<float>(a.p, R * inv_b);
+
+    // Gradient for b: -a/b² only if |b| >= min_denom
+    // When clamped, b's gradient is zero (clamp kills gradient)
+    if (abs(b.p) >= min_denom) {
+        b = DifferentialPair<float>(b.p, -a.p * inv_b2 * R);
+    } else {
+        b = DifferentialPair<float>(b.p, 0.0f);
+    }
+}
+
+[BackwardDerivative(bw_safe_div_clamp)]
+float safe_div_clamp(float a, float b, float min_denom = 1e-6f) {
+    return a / max(abs(b), min_denom);
+}
+
+[Differentiable]
+float3 safe_div_clamp(float3 a, float b, float min_denom = 1e-6f) {
+    return float3(
+        safe_div_clamp(a.x, b, min_denom),
+        safe_div_clamp(a.y, b, min_denom),
+        safe_div_clamp(a.z, b, min_denom)
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Strategy 4: L'Hôpital-aware division (for true 0/0 with known limit)
+// -----------------------------------------------------------------------------
+// When we know a = k*b (linear relationship), the limit a/b = k
+// This computes the ratio stably even when both approach zero
+//
+// Mathematical basis:
+//   If a(t) = k(t) * b(t), then a/b = k
+//   When b→0: use the fact that da/db = k (derivative gives the ratio)
+//
+// For volume rendering: weighted_color = sigma * color
+//   So: weighted_color / sigma = color (the limit is just color)
+
+void bw_safe_ratio(
+    inout DifferentialPair<float> a,
+    inout DifferentialPair<float> b,
+    float known_limit,  // The value we know the ratio converges to
+    float.Differential R)
+{
+    if (abs(b.p) < TINY_VAL && abs(a.p) < TINY_VAL) {
+        // True 0/0 case: use known limit
+        // Gradient: d(limit)/da = 0, d(limit)/db = 0 (it's a constant)
+        // But we want gradient to flow through the original computation
+        //
+        // If a = k*b, then da = k*db + b*dk
+        // When b=0: da ≈ k*db, so da/db = k = limit
+        // This means: d(a/b)/da ≈ 1/b is undefined, but the ratio itself is k
+        //
+        // For training stability: zero out gradients at the singularity
+        a = DifferentialPair<float>(a.p, 0.0f);
+        b = DifferentialPair<float>(b.p, 0.0f);
+    } else if (abs(b.p) < TINY_VAL) {
+        // b≈0 but a≠0: ratio is ±∞, something is wrong
+        // Zero gradients to prevent explosion
+        a = DifferentialPair<float>(a.p, 0.0f);
+        b = DifferentialPair<float>(b.p, 0.0f);
+    } else {
+        // Normal case: standard quotient rule
+        float inv_b = 1.0f / b.p;
+        float inv_b2 = inv_b * inv_b;
+        a = DifferentialPair<float>(a.p, R * inv_b);
+        b = DifferentialPair<float>(b.p, -a.p * inv_b2 * R);
+    }
+}
+
+[BackwardDerivative(bw_safe_ratio)]
+float safe_ratio(float a, float b, float known_limit) {
+    if (abs(b) < TINY_VAL && abs(a) < TINY_VAL) {
+        return known_limit;  // Return the known limit for 0/0
+    } else if (abs(b) < TINY_VAL) {
+        return sign(a) * 1e6f;  // Large value with correct sign (shouldn't happen)
+    } else {
+        return a / b;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Volume Rendering Specific: Color extraction from weighted contribution
+// -----------------------------------------------------------------------------
+// Use case: color = (sigma * original_color) / sigma = original_color
+// When sigma→0, both numerator and denominator →0, but limit is original_color
+//
+// In practice, we don't know original_color, so we use fallback=0
+// The key is that when sigma=0, this sample contributes nothing to final color
+
+[Differentiable]
+float3 extract_color_from_weighted(float3 weighted_color, float sigma) {
+    // When sigma is tiny, the contribution is negligible
+    // Return zero (or could return weighted_color as approximation)
+    return safe_div_fallback(weighted_color, sigma, float3(0.0f));
+}
+
+// -----------------------------------------------------------------------------
+// Volume Rendering Specific: Expected depth extraction
+// -----------------------------------------------------------------------------
+// Use case: depth = depth_num / alpha
+// When alpha→0 (transparent), depth is undefined and doesn't matter
+
+[Differentiable]
+float extract_depth(float depth_num, float alpha, float default_depth = 0.0f) {
+    return safe_div_fallback(depth_num, alpha, default_depth);
+}
+
+// -----------------------------------------------------------------------------
+// Volume Rendering Specific: Suffix color for gradient computation
+// -----------------------------------------------------------------------------
+// Use case: rgb_bg = suffix / T (instant-ngp train_nerf.cuh:400)
+// Pattern: const vec3 rgb_bg = suffix / fmaxf(1e-6f, T);
+
+[Differentiable]
+float3 extract_suffix_color(float3 suffix, float T) {
+    // instant-ngp uses fmaxf(1e-6f, T) to clamp denominator
+    return safe_div_clamp(suffix, T, 1e-6f);
+}
+
+// =============================================================================
 // Safe Square Root & Normalization
 // =============================================================================
 
